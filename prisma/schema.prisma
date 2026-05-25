@@ -1,0 +1,339 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  admin
+  mentor_topik
+  user
+}
+
+enum InstitutionType {
+  university    // Universitas / Institut
+  college       // Sekolah Tinggi
+  polytechnic   // Politeknik
+  smk           // SMK
+  sma           // SMA / MA
+  other         // Lainnya
+}
+
+enum QuizLevel {
+  easy
+  medium
+  hard
+}
+
+enum QuestionStatus {
+  draft     // Dibuat mentor/admin, belum aktif
+  active    // Aktif, bisa muncul di quiz
+  archived  // Tidak aktif lagi
+}
+
+enum SessionStatus {
+  in_progress // Quiz sedang berjalan
+  completed   // Selesai normal
+  abandoned   // Tab ditutup / timeout total
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSTITUTIONS
+// Kampus, politeknik, SMA, SMK — bisa ditambah user atau admin
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Institution {
+  id        String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String          @db.VarChar(200)
+  type      InstitutionType
+  city      String?         @db.VarChar(100)
+  province  String?         @db.VarChar(100)
+  verified  Boolean         @default(false) // admin verifikasi institusi baru
+  createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz
+
+  profiles           Profile[]
+  leaderboardEntries LeaderboardEntry[]
+
+  @@index([type])
+  @@index([name])
+  @@map("institutions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROFILES
+// Satu baris per auth user — dibuat otomatis setelah register via trigger
+// atau manual di onboarding page
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Profile {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String    @unique @db.Uuid @map("user_id")
+  institutionId String?   @db.Uuid @map("institution_id")
+
+  name          String    @db.VarChar(100)
+  username      String    @unique @db.VarChar(50)
+  major         String?   @db.VarChar(100)   // Jurusan / Program studi
+  bio           String?   @db.VarChar(300)
+  avatarUrl     String?   @map("avatar_url")
+  role          Role      @default(user)
+  profileComplete Boolean @default(false) @map("profile_complete") // true setelah isi profil
+
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  institution        Institution?       @relation(fields: [institutionId], references: [id])
+  quizSessions       QuizSession[]
+  streak             Streak?
+  leaderboardEntries LeaderboardEntry[]
+  mentorAssignments  MentorAssignment[]
+
+  // Soal & subtopik yang dibuat oleh user ini (jika mentor/admin)
+  createdQuestions Question[] @relation("QuestionCreator")
+  createdSubtopics Subtopic[] @relation("SubtopicCreator")
+
+  @@index([username])
+  @@index([institutionId])
+  @@map("profiles")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOPICS & SUBTOPICS
+// Topik utama: Web, Cyber Security, Mobile, dll.
+// Sub-topik  : React, Laravel, Vue (di bawah Web), dll.
+// Admin bisa buat topik baru; mentor bisa buat subtopik (jika di-assign)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Topic {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String   @db.VarChar(100)
+  slug        String   @unique @db.VarChar(100) // "web", "cyber-security"
+  description String?  @db.VarChar(500)
+  icon        String?  @db.VarChar(50) // nama ikon Tabler / Lucide, misal "code"
+  coverColor  String?  @map("cover_color") @db.VarChar(7) // hex color untuk UI card topik
+  active      Boolean  @default(true)
+  sortOrder   Int      @default(0) @map("sort_order")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  subtopics Subtopic[]
+
+  @@map("topics")
+}
+
+model Subtopic {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  topicId     String   @db.Uuid @map("topic_id")
+  createdById String?  @db.Uuid @map("created_by") // mentor atau admin yang buat
+  name        String   @db.VarChar(100)
+  slug        String   @db.VarChar(100)            // "react", "laravel"
+  description String?  @db.VarChar(500)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  topic             Topic              @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  createdBy         Profile?           @relation("SubtopicCreator", fields: [createdById], references: [id])
+  questions         Question[]
+  quizSessions      QuizSession[]
+  mentorAssignments MentorAssignment[]
+  leaderboardEntries LeaderboardEntry[]
+
+  @@unique([topicId, slug])
+  @@index([topicId])
+  @@map("subtopics")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUESTIONS
+// Dibuat oleh admin atau mentor_topik (sesuai subtopik yang di-assign)
+// options  : JSONB → [{ "label": "A", "text": "Lorem ipsum" }, ...]
+// explanation: ditampilkan di halaman hasil quiz agar edukatif
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Question {
+  id           String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  subtopicId   String         @db.Uuid @map("subtopic_id")
+  createdById  String?        @db.Uuid @map("created_by")
+
+  questionText String         @map("question_text")
+  // Struktur options JSON: [{ "label": "A", "text": "..." }, { "label": "B", "text": "..." }, ...]
+  // Selalu 4 pilihan (index 0-3)
+  options      Json
+  correctIndex Int            @map("correct_index") // 0, 1, 2, atau 3
+  level        QuizLevel
+  explanation  String?        // Penjelasan kenapa jawaban ini benar
+  status       QuestionStatus @default(draft)
+
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime       @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  subtopic       Subtopic        @relation(fields: [subtopicId], references: [id], onDelete: Cascade)
+  createdBy      Profile?        @relation("QuestionCreator", fields: [createdById], references: [id])
+  sessionAnswers SessionAnswer[]
+
+  // Index untuk random pick soal aktif per subtopik + level
+  @@index([subtopicId, level, status])
+  @@map("questions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUIZ SESSIONS
+// Satu sesi = satu ronde quiz (10 soal) oleh satu user
+// correctCount + wrongCount + skippedCount harus = 10 saat status completed
+// ─────────────────────────────────────────────────────────────────────────────
+
+model QuizSession {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String        @db.Uuid @map("user_id")
+  subtopicId   String        @db.Uuid @map("subtopic_id")
+  level        QuizLevel
+  status       SessionStatus @default(in_progress)
+
+  totalScore   Int           @default(0) @map("total_score")
+  correctCount Int           @default(0) @map("correct_count")
+  wrongCount   Int           @default(0) @map("wrong_count")
+  skippedCount Int           @default(0) @map("skipped_count") // timeout tanpa jawab
+
+  // Total durasi aktual quiz dalam ms (dari soal pertama ke submit terakhir)
+  durationMs   Int?          @map("duration_ms")
+
+  startedAt    DateTime      @default(now()) @map("started_at") @db.Timestamptz
+  completedAt  DateTime?     @map("completed_at") @db.Timestamptz
+
+  // Relations
+  user             Profile         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subtopic         Subtopic        @relation(fields: [subtopicId], references: [id])
+  answers          SessionAnswer[]
+  leaderboardEntries LeaderboardEntry[] // Many-to-One: satu sesi bisa jadi best session di beberapa subtopik (via leaderboard)
+
+  @@index([userId, completedAt(sort: Desc)])    // profile page: riwayat quiz terbaru
+  @@index([subtopicId, totalScore(sort: Desc)]) // leaderboard per subtopik
+  @@map("quiz_sessions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION ANSWERS
+// Satu baris per soal per sesi
+// chosenIndex null  → user tidak sempat menjawab (timeout per soal)
+// timesTakenMs      → waktu dari soal muncul sampai user klik jawaban (ms)
+// scoreEarned       → hasil formula: base + time_bonus + streak_bonus
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SessionAnswer {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionId    String   @db.Uuid @map("session_id")
+  questionId   String   @db.Uuid @map("question_id")
+
+  chosenIndex  Int?     @map("chosen_index")   // null jika timeout
+  timeTakenMs  Int      @map("time_taken_ms")  // durasi jawab dalam ms
+  scoreEarned  Int      @default(0) @map("score_earned")
+  isCorrect    Boolean  @default(false) @map("is_correct")
+  answeredAt   DateTime @default(now()) @map("answered_at") @db.Timestamptz
+
+  // Relations
+  session  QuizSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question Question    @relation(fields: [questionId], references: [id])
+
+  // Satu soal hanya boleh dijawab sekali per sesi
+  @@unique([sessionId, questionId])
+  @@index([sessionId])
+  @@map("session_answers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STREAKS
+// Satu baris per user — di-update setelah setiap sesi quiz selesai
+//
+// Logic streak (di aplikasi):
+//   - lastPlayed == hari ini       → tidak update streak (quiz ke-2 hari sama)
+//   - lastPlayed == kemarin        → currentStreak++
+//   - lastPlayed < kemarin / null  → reset currentStreak = 1
+//   - longestStreak = max(longestStreak, currentStreak)
+//
+// Logic daily limit (fallback dari Redis):
+//   - lastPlayed == hari ini DAN quizzesPlayedToday >= LIMIT → tolak quiz baru
+//   - lastPlayed != hari ini → reset quizzesPlayedToday = 0, lalu izinkan
+//   - Setiap selesai quiz  → quizzesPlayedToday++
+//
+// Redis tetap jadi primary limiter (lebih cepat).
+// Field ini adalah safety net jika Redis kuota habis atau down.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Streak {
+  id                  String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId              String    @unique @db.Uuid @map("user_id")
+  currentStreak       Int       @default(0) @map("current_streak")
+  longestStreak       Int       @default(0) @map("longest_streak")
+  lastPlayed          DateTime? @map("last_played") @db.Date // DATE saja, tanpa waktu
+
+  // Fallback daily limit — reset otomatis setiap lastPlayed berganti hari
+  quizzesPlayedToday  Int       @default(0) @map("quizzes_played_today")
+
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  user Profile @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("streaks")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LEADERBOARD ENTRIES
+// Satu baris per user per subtopik — di-upsert setelah sesi selesai
+// Jika skor baru > bestScore → update bestScore + sessionId
+// institutionId di-denormalisasi dari profile untuk query per-institusi
+// yang cepat tanpa JOIN ke profiles setiap kali
+// ─────────────────────────────────────────────────────────────────────────────
+
+model LeaderboardEntry {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String   @db.Uuid @map("user_id")
+  subtopicId    String   @db.Uuid @map("subtopic_id")
+  institutionId String?  @db.Uuid @map("institution_id") // denormalisasi dari profiles
+  // TANPA @unique — relasi Many-to-One agar bisa di-upsert bebas saat skor baru lebih tinggi
+  // Satu QuizSession bisa (secara teknis) dirujuk oleh beberapa LeaderboardEntry di subtopik berbeda
+  sessionId     String   @db.Uuid @map("session_id")
+
+  bestScore     Int      @map("best_score")
+  totalGames    Int      @default(1) @map("total_games")
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  user        Profile      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subtopic    Subtopic     @relation(fields: [subtopicId], references: [id])
+  institution Institution? @relation(fields: [institutionId], references: [id])
+  session     QuizSession  @relation(fields: [sessionId], references: [id])
+
+  // Satu entri per user per subtopik
+  @@unique([userId, subtopicId])
+  // Leaderboard global per subtopik (ORDER BY best_score DESC)
+  @@index([subtopicId, bestScore(sort: Desc)])
+  // Leaderboard per institusi (filter institution_id, ORDER BY best_score DESC)
+  @@index([institutionId, subtopicId, bestScore(sort: Desc)])
+  @@map("leaderboard_entries")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MENTOR ASSIGNMENTS
+// Mendefinisikan subtopik mana yang boleh dikelola oleh mentor tertentu
+// Admin assign mentor ke subtopik via admin panel
+// Quiz API & question CRUD mengecek tabel ini sebelum izinkan aksi mentor
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MentorAssignment {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mentorId   String   @db.Uuid @map("mentor_id")
+  subtopicId String   @db.Uuid @map("subtopic_id")
+  assignedAt DateTime @default(now()) @map("assigned_at") @db.Timestamptz
+
+  mentor   Profile  @relation(fields: [mentorId], references: [id], onDelete: Cascade)
+  subtopic Subtopic @relation(fields: [subtopicId], references: [id], onDelete: Cascade)
+
+  // Satu mentor tidak bisa di-assign ke subtopik yang sama dua kali
+  @@unique([mentorId, subtopicId])
+  @@index([mentorId])
+  @@map("mentor_assignments")
+}
